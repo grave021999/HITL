@@ -1,5 +1,5 @@
 """
-Interactive HITL Agent - Allows unsolicited user input to interrupt and cancel ongoing tasks.
+HITL Agent - Allows unsolicited user input to interrupt and cancel ongoing tasks.
 
 Usage:
     python HITL_Agent.py
@@ -39,8 +39,8 @@ class AgentState(TypedDict):
     task_cancelled_at: Optional[str]
 
 
-class InteractiveHITLAgent:
-    """Interactive agent that can be interrupted by unsolicited user input."""
+class HITLAgent:
+    """Agent that can be interrupted by unsolicited user input."""
     
     def __init__(self, api_key: str = None):
         api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
@@ -198,12 +198,12 @@ Be concise and focused on what was requested.
         state["output"] = response.content
         return state
     
-    async def run_interactive(self, thread_id: str = "interactive_session"):
-        """Run interactive HITL session."""
+    async def run(self, thread_id: str = "hitl_session"):
+        """Run HITL session."""
         config = {"configurable": {"thread_id": thread_id}}
         
         print("=" * 80)
-        print("Interactive HITL Agent")
+        print("HITL Agent")
         print("=" * 80)
         print("\nInstructions:")
         print("- Enter any query/task for the agent")
@@ -278,8 +278,8 @@ Be concise and focused on what was requested.
 async def main():
     """Main entry point."""
     try:
-        agent = InteractiveHITLAgent()
-        await agent.run_interactive()
+        agent = HITLAgent()
+        await agent.run()
     except KeyboardInterrupt:
         print("\n\nInterrupted by user. Exiting...")
     except Exception as e:

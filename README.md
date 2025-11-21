@@ -1,10 +1,10 @@
-# Interactive Human-in-the-Loop (HITL) Agent
+# Human-in-the-Loop (HITL) Agent
 
-An interactive agent that allows unsolicited user input to interrupt and cancel ongoing tasks, following the official LangGraph interrupt pattern.
+An agent that allows unsolicited user input to interrupt and cancel ongoing tasks, following the official LangGraph interrupt pattern.
 
 ## Features
 
-- ✅ **Interactive terminal interface** - Enter any query/task
+- ✅ **Terminal interface** - Enter any query/task
 - ✅ **Real-time interruption** - Send new queries during 60-second processing window
 - ✅ **Task cancellation** - Previous task is cancelled when interrupted
 - ✅ **Immediate switching** - New task starts right away
@@ -37,7 +37,7 @@ export ANTHROPIC_API_KEY=your_api_key_here
 
 ### Usage
 
-Run the interactive agent:
+Run the agent:
 ```bash
 python HITL_Agent.py
 ```
@@ -76,7 +76,7 @@ This implementation follows the official LangGraph HITL pattern:
 - Uses `MemorySaver` checkpointer for state persistence
 - Follows TypedDict state schema pattern
 
-See [INTERACTIVE_USAGE.md](INTERACTIVE_USAGE.md) for detailed usage guide.
+See [USAGE.md](USAGE.md) for detailed usage guide.
 
 ## Documentation References
 

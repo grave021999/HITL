@@ -1,8 +1,8 @@
-# Interactive HITL Agent - Usage Guide
+# HITL Agent - Usage Guide
 
 ## Overview
 
-This interactive agent allows you to:
+This agent allows you to:
 - Enter **any query/task** (not hardcoded)
 - Agent processes for 60 seconds
 - **During processing**, you can send a **NEW query** to interrupt
