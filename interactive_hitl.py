@@ -14,11 +14,8 @@ Features:
 
 import asyncio
 import os
-import sys
 from datetime import datetime
 from typing import Optional, TypedDict, Annotated
-from queue import Queue
-import threading
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, BaseMessage
@@ -57,7 +54,6 @@ class InteractiveHITLAgent:
             temperature=0.7,
         )
         self.memory = MemorySaver()
-        self.input_queue = Queue()
         self.graph = self._build_graph()
     
     def _build_graph(self):
