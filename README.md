@@ -39,7 +39,7 @@ export ANTHROPIC_API_KEY=your_api_key_here
 
 Run the interactive agent:
 ```bash
-python interactive_hitl.py
+python HITL_Agent.py
 ```
 
 ## How It Works

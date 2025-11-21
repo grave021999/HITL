@@ -11,7 +11,7 @@ This interactive agent allows you to:
 
 ## How It Works
 
-1. **Start the agent**: `python interactive_hitl.py`
+1. **Start the agent**: `python HITL_Agent.py`
 2. **Enter your first query**: Type any task (e.g., "Write a report on AI")
 3. **Agent starts processing**: Works for 60 seconds
 4. **During processing**: 

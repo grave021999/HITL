@@ -2,7 +2,7 @@
 Interactive HITL Agent - Allows unsolicited user input to interrupt and cancel ongoing tasks.
 
 Usage:
-    python interactive_hitl.py
+    python HITL_Agent.py
 
 Features:
 - User can input ANY query
