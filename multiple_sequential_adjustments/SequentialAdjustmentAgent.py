@@ -56,36 +56,70 @@ class SequentialAdjustmentAgent:
     
     def _is_adjustment(self, new_input: str, current_goal: str) -> bool:
         """
-        Determine if new input is an adjustment to current task or a new task.
+        Determine if new input is an adjustment to current task or a new task (cancellation).
         
-        Returns True if it's an adjustment (should be combined), False if it's a new task.
+        Returns True if it's an adjustment (should be combined), False if it's a new task (should cancel).
+        
+        Test Case 1 (Cancellation): "Actually, just focus on quantum entanglement, make it 2 pages"
+        → Should return False (new task, cancels previous)
+        
+        Test Case 2 (Adjustments): "Add JWT authentication", "Use FastAPI framework specifically"
+        → Should return True (adjustments, combine with previous)
         """
         new_input_lower = new_input.strip().lower()
+        current_goal_lower = current_goal.lower()
+        
+        # Cancellation indicators - these suggest it's a NEW task that cancels the previous one
+        cancellation_indicators = [
+            "actually", "instead", "just focus on", "just do", "forget", "ignore",
+            "cancel", "stop", "change to", "switch to", "do this instead",
+            "no wait", "wait", "scratch that", "never mind"
+        ]
+        
+        # Check if input starts with cancellation indicators
+        for indicator in cancellation_indicators:
+            if new_input_lower.startswith(indicator):
+                return False  # New task, cancels previous
         
         # Adjustment indicators - these suggest it's an addition/modification to current task
         adjustment_indicators = [
-            "also", "and", "add", "include", "make it", "change it to", 
-            "change to", "update", "modify", "adjust", "edit", "expand",
-            "elaborate", "explain more", "more", "further", "additionally",
-            "use", "specifically", "with", "implement", "ensure"
+            "also", "and", "add", "include", "make it", "update", "modify", 
+            "adjust", "edit", "expand", "elaborate", "explain more", "more", 
+            "further", "additionally", "use", "specifically", "with", 
+            "implement", "ensure", "make sure", "don't forget"
         ]
         
         # Check if input starts with adjustment indicators
         for indicator in adjustment_indicators:
             if new_input_lower.startswith(indicator):
-                return True
+                return True  # Adjustment, combine with current
         
-        # If input is short and doesn't look like a complete new task, treat as adjustment
-        if len(new_input.strip().split()) <= 8:
-            # Check if it doesn't contain a complete sentence/question structure
-            if not any(char in new_input for char in ['?', '!']) and len(new_input.strip()) < 60:
+        # If input contains "focus on" or "just" at the start, likely a cancellation
+        if new_input_lower.startswith("focus on") or new_input_lower.startswith("just "):
+            # Unless it's clearly an addition like "just add" or "just include"
+            if not any(adj in new_input_lower for adj in ["just add", "just include", "just make"]):
+                return False  # Likely cancellation
+        
+        # If input is very short (likely a quick addition), treat as adjustment
+        if len(new_input.strip().split()) <= 5:
+            if not any(char in new_input for char in ['?', '!', '.']) and len(new_input.strip()) < 50:
                 return True
         
         # If input is a complete standalone task (longer, has structure), treat as new task
         if len(new_input.strip()) > 60:
-            # Check if it's clearly a new topic (starts with capital, has question mark)
-            if new_input.strip()[0].isupper() and '?' in new_input:
+            # Check if it's clearly a new topic
+            if new_input.strip()[0].isupper() and ('?' in new_input or '.' in new_input):
                 return False
+        
+        # If input doesn't reference current goal and is substantial, likely new task
+        # Check if any words from current goal appear in new input
+        current_words = set(current_goal_lower.split())
+        new_words = set(new_input_lower.split())
+        overlap = len(current_words.intersection(new_words))
+        
+        # If very little overlap and input is substantial, likely new task
+        if overlap < 2 and len(new_input.strip().split()) > 8:
+            return False
         
         # Default: treat as adjustment if it's relatively short
         return len(new_input.strip().split()) <= 10
@@ -112,7 +146,8 @@ class SequentialAdjustmentAgent:
         workflow.add_node("process", self._process_task)
         workflow.add_node("generate", self._generate_output)
         
-        workflow.set_entry_point("check_input")
+        # Entry point is process - start processing immediately after initial query
+        workflow.set_entry_point("process")
         workflow.add_conditional_edges(
             "check_input",
             self._route_after_check,
@@ -292,18 +327,21 @@ class SequentialAdjustmentAgent:
                         "messages": messages,
                     }
                 else:
-                    # New task - reset
-                    print(f"\n[NEW TASK] Received during work: '{new_input}'")
-                    print(f"[RESET] Starting new task")
+                    # New task - CANCEL previous task and start new one
+                    previous_goal = goal
+                    print(f"\n[CANCEL] Previous task cancelled: '{previous_goal}'")
+                    print(f"[NEW TASK] Starting new task: '{new_input.strip()}'")
+                    print(f"[RESET] All previous work cancelled, switching to new direction")
                     
                     return {
                         **state,
                         "initial_goal": new_input.strip(),
                         "current_goal": new_input.strip(),
-                        "all_adjustments": [],
+                        "all_adjustments": [],  # Reset adjustments for new task
                         "adjustment_count": 0,
                         "task_started_at": datetime.now().isoformat(),
                         "messages": messages,
+                        "continue_checking": False,  # New task, proceed to process
                     }
             
             # Simulate work
