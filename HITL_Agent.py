@@ -42,6 +42,44 @@ class AgentState(TypedDict):
 class HITLAgent:
     """Agent that can be interrupted by unsolicited user input."""
     
+    def _is_follow_up(self, new_input: str, current_goal: str) -> bool:
+        """
+        Determine if new input is a follow-up/adjustment to current task or a new task.
+        
+        Returns True if it's a follow-up (should be combined), False if it's a new task (should cancel).
+        """
+        new_input_lower = new_input.strip().lower()
+        current_goal_lower = current_goal.lower()
+        
+        # Follow-up indicators - these suggest it's an addition/adjustment to current task
+        follow_up_indicators = [
+            "also", "and", "add", "include", "make it", "change it to", 
+            "change to", "update", "modify", "adjust", "edit", "expand",
+            "elaborate", "explain more", "more", "further", "additionally"
+        ]
+        
+        # Check if input starts with follow-up indicators
+        for indicator in follow_up_indicators:
+            if new_input_lower.startswith(indicator):
+                return True
+        
+        # If input is very short (likely a quick addition), treat as follow-up
+        if len(new_input.strip().split()) <= 5:
+            # Check if it doesn't contain a complete sentence/question structure
+            if not any(char in new_input for char in ['?', '!', '.']) and len(new_input.strip()) < 50:
+                return True
+        
+        # If input is a complete standalone task (longer, has structure), treat as new task
+        if len(new_input.strip()) > 50 or '?' in new_input or new_input.strip()[0].isupper():
+            # Check if it's clearly a new topic (doesn't reference current goal)
+            # Simple heuristic: if it's a question or starts with capital, likely new task
+            if new_input.strip()[0].isupper() and len(new_input.strip().split()) > 3:
+                return False
+        
+        # Default: if input is short and doesn't start with follow-up words, 
+        # but also doesn't look like a complete new task, treat as follow-up
+        return len(new_input.strip().split()) <= 8
+    
     def __init__(self, api_key: str = None):
         api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
@@ -104,21 +142,39 @@ class HITLAgent:
         prompt = f"Current task: '{current_goal[:60]}...' | Send new task to interrupt, or press Enter to continue."
         new_input = interrupt(prompt)
         
-        # If new input received and different from current goal, cancel previous task
+        # If new input received and different from current goal
         if new_input and new_input.strip() and new_input.strip() != current_goal:
-            print(f"\n[INTERRUPT] New input received: '{new_input}'")
-            print(f"[CANCEL] Cancelling previous task: '{current_goal}'")
+            # Determine if it's a follow-up adjustment or a new task
+            is_follow_up = self._is_follow_up(new_input.strip(), current_goal)
             
-            state["previous_goal"] = current_goal
-            state["current_goal"] = new_input.strip()
-            state["cancelled"] = True
-            state["task_cancelled_at"] = datetime.now().isoformat()
-            state["output"] = ""  # Clear previous output
-            
-            # Add new message
-            if "messages" not in state:
-                state["messages"] = []
-            state["messages"].append(HumanMessage(content=new_input.strip()))
+            if is_follow_up:
+                # Combine with current goal (adjustment/follow-up)
+                combined_goal = f"{current_goal} {new_input.strip()}"
+                print(f"\n[ADJUST] Follow-up received: '{new_input}'")
+                print(f"[UPDATE] Updating task: '{current_goal}' -> '{combined_goal}'")
+                
+                state["current_goal"] = combined_goal
+                state["cancelled"] = False  # Not cancelled, just adjusted
+                
+                # Add new message
+                if "messages" not in state:
+                    state["messages"] = []
+                state["messages"].append(HumanMessage(content=new_input.strip()))
+            else:
+                # New task - cancel previous and switch
+                print(f"\n[INTERRUPT] New task received: '{new_input}'")
+                print(f"[CANCEL] Cancelling previous task: '{current_goal}'")
+                
+                state["previous_goal"] = current_goal
+                state["current_goal"] = new_input.strip()
+                state["cancelled"] = True
+                state["task_cancelled_at"] = datetime.now().isoformat()
+                state["output"] = ""  # Clear previous output
+                
+                # Add new message
+                if "messages" not in state:
+                    state["messages"] = []
+                state["messages"].append(HumanMessage(content=new_input.strip()))
         else:
             state["cancelled"] = False
         
@@ -147,24 +203,40 @@ class HITLAgent:
             # When resumed with Command(resume=value), that value is returned here
             new_input = interrupt(f"Working on '{goal[:40]}...' ({elapsed:.0f}s elapsed). Send new task to interrupt, or Enter to continue.")
             
-            # If new input received and different, cancel and return immediately
+            # If new input received and different, check if it's follow-up or new task
             if new_input and new_input.strip() and new_input.strip() != goal:
-                print(f"\n[INTERRUPT] New task received during work: '{new_input}'")
-                print(f"[CANCEL] Stopping current work on: '{goal}'")
+                # Determine if it's a follow-up adjustment or a new task
+                is_follow_up = self._is_follow_up(new_input.strip(), goal)
                 
-                # Update state with new task
                 messages = state.get("messages", [])
                 messages.append(HumanMessage(content=new_input.strip()))
                 
-                return {
-                    **state,
-                    "previous_goal": goal,
-                    "current_goal": new_input.strip(),
-                    "cancelled": True,
-                    "task_cancelled_at": datetime.now().isoformat(),
-                    "output": "",
-                    "messages": messages,
-                }
+                if is_follow_up:
+                    # Combine with current goal (adjustment/follow-up)
+                    combined_goal = f"{goal} {new_input.strip()}"
+                    print(f"\n[ADJUST] Follow-up received during work: '{new_input}'")
+                    print(f"[UPDATE] Updating task: '{goal}' -> '{combined_goal}'")
+                    
+                    return {
+                        **state,
+                        "current_goal": combined_goal,
+                        "cancelled": False,  # Not cancelled, just adjusted
+                        "messages": messages,
+                    }
+                else:
+                    # New task - cancel and switch
+                    print(f"\n[INTERRUPT] New task received during work: '{new_input}'")
+                    print(f"[CANCEL] Stopping current work on: '{goal}'")
+                    
+                    return {
+                        **state,
+                        "previous_goal": goal,
+                        "current_goal": new_input.strip(),
+                        "cancelled": True,
+                        "task_cancelled_at": datetime.now().isoformat(),
+                        "output": "",
+                        "messages": messages,
+                    }
             
             # Simulate work (synchronous sleep - nodes should be sync unless doing async I/O)
             import time
