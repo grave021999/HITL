@@ -1,550 +1,531 @@
 """
-Sequential Adjustment HITL Agent - Handles multiple user corrections during a single session.
+Sequential Adjustment HITL Agent
 
 Usage:
     python SequentialAdjustmentAgent.py
 
-Features:
-- User can input initial task
-- Agent processes with periodic interrupt checks
-- User can send multiple sequential adjustments
-- All adjustments are combined and maintained in context
-- Final output includes all adjustments
-- Session history reflects all user inputs
-- Agent maintains conversation context throughout
+What this does
+--------------
+- User gives an initial task (any scenario).
+- Agent collects zero or more sequential "adjustments" from the user
+  using LangGraph's human-in-the-loop `interrupt` + `Command(resume=...)` pattern.
+- Adjustments are merged with the initial goal into a single combined goal.
+- The final LLM call is made with full conversation history.
+- Final output is generated using ALL requirements (initial + adjustments).
 
-Follows official LangGraph HITL interrupt pattern:
+This matches the official LangGraph Human-in-the-loop pattern:
 https://langchain-ai.github.io/langgraph/how-tos/human_in_the_loop/wait-user-input/
+
+You can test with any scenario, for example:
+
+1. Initial: "Create a Python REST API for user management"
+2. Adjustment: "Add JWT authentication"
+3. Adjustment: "Use FastAPI framework specifically"
+
+But nothing is hardcoded for this; it's just one example.
 """
 
-import asyncio
 import os
-from datetime import datetime
-from typing import Optional, TypedDict, Annotated, List
+from datetime import datetime, timezone
+from typing import Annotated, List, Optional, TypedDict
 
+from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, BaseMessage
-from langgraph.graph import StateGraph, END
+from langchain_core.messages import AnyMessage, HumanMessage
+
+from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
-from dotenv import load_dotenv
 
 load_dotenv()
 
 
-class SequentialAgentState(TypedDict):
-    """State schema following LangGraph documentation pattern."""
-    messages: Annotated[list[BaseMessage], add_messages]
-    initial_goal: str
+# --------------------------------------------------------------------------------------
+# State
+# --------------------------------------------------------------------------------------
+
+
+class SequentialAdjustmentState(TypedDict, total=False):
+    """State schema compatible with LangGraph + extra fields for our use-case.
+
+    Keys:
+      - messages: full chat history (user + assistant). Required by LangGraph.
+      - base_goal: initial task from the user.
+      - current_goal: base_goal + all adjustments combined.
+      - adjustments: list of adjustment strings (in order).
+      - adjustment_count: len(adjustments).
+      - output: final generated content from the LLM.
+      - created_at / last_updated_at: simple timestamps.
+      - done_collecting: True when user is finished giving adjustments.
+    """
+
+    messages: Annotated[List[AnyMessage], add_messages]
+    base_goal: str
     current_goal: str
-    all_adjustments: List[str]  # Track all sequential adjustments
+    adjustments: List[str]
     adjustment_count: int
     output: str
-    task_started_at: str
-    last_adjustment_at: Optional[str]
-    continue_checking: bool  # Flag to continue checking for more adjustments
+    created_at: str
+    last_updated_at: str
+    done_collecting: bool
+
+
+# --------------------------------------------------------------------------------------
+# Agent
+# --------------------------------------------------------------------------------------
 
 
 class SequentialAdjustmentAgent:
     """
-    Agent that handles multiple sequential adjustments during a single session.
-    
-    Follows LangGraph interrupt() pattern for HITL interactions.
-    Maintains conversation context and combines all adjustments into final output.
+    Agent that supports multiple sequential user adjustments in a single session,
+    using LangGraph's human-in-the-loop `interrupt()` mechanism.
     """
-    
-    def _is_adjustment(self, new_input: str, current_goal: str) -> bool:
-        """
-        Determine if new input is an adjustment to current task or a new task (cancellation).
-        
-        Returns True if it's an adjustment (should be combined), False if it's a new task (should cancel).
-        
-        Test Case 1 (Cancellation): "Actually, just focus on quantum entanglement, make it 2 pages"
-        → Should return False (new task, cancels previous)
-        
-        Test Case 2 (Adjustments): "Add JWT authentication", "Use FastAPI framework specifically"
-        → Should return True (adjustments, combine with previous)
-        """
-        new_input_lower = new_input.strip().lower()
-        current_goal_lower = current_goal.lower()
-        
-        # Cancellation indicators - these suggest it's a NEW task that cancels the previous one
-        cancellation_indicators = [
-            "actually", "instead", "just focus on", "just do", "forget", "ignore",
-            "cancel", "stop", "change to", "switch to", "do this instead",
-            "no wait", "wait", "scratch that", "never mind"
-        ]
-        
-        # Check if input starts with cancellation indicators
-        for indicator in cancellation_indicators:
-            if new_input_lower.startswith(indicator):
-                return False  # New task, cancels previous
-        
-        # Adjustment indicators - these suggest it's an addition/modification to current task
-        adjustment_indicators = [
-            "also", "and", "add", "include", "make it", "update", "modify", 
-            "adjust", "edit", "expand", "elaborate", "explain more", "more", 
-            "further", "additionally", "use", "specifically", "with", 
-            "implement", "ensure", "make sure", "don't forget"
-        ]
-        
-        # Check if input starts with adjustment indicators
-        for indicator in adjustment_indicators:
-            if new_input_lower.startswith(indicator):
-                return True  # Adjustment, combine with current
-        
-        # If input contains "focus on" or "just" at the start, likely a cancellation
-        if new_input_lower.startswith("focus on") or new_input_lower.startswith("just "):
-            # Unless it's clearly an addition like "just add" or "just include"
-            if not any(adj in new_input_lower for adj in ["just add", "just include", "just make"]):
-                return False  # Likely cancellation
-        
-        # If input is very short (likely a quick addition), treat as adjustment
-        if len(new_input.strip().split()) <= 5:
-            if not any(char in new_input for char in ['?', '!', '.']) and len(new_input.strip()) < 50:
-                return True
-        
-        # If input is a complete standalone task (longer, has structure), treat as new task
-        if len(new_input.strip()) > 60:
-            # Check if it's clearly a new topic
-            if new_input.strip()[0].isupper() and ('?' in new_input or '.' in new_input):
-                return False
-        
-        # If input doesn't reference current goal and is substantial, likely new task
-        # Check if any words from current goal appear in new input
-        current_words = set(current_goal_lower.split())
-        new_words = set(new_input_lower.split())
-        overlap = len(current_words.intersection(new_words))
-        
-        # If very little overlap and input is substantial, likely new task
-        if overlap < 2 and len(new_input.strip().split()) > 8:
-            return False
-        
-        # Default: treat as adjustment if it's relatively short
-        return len(new_input.strip().split()) <= 10
-    
-    def __init__(self, api_key: str = None):
+
+    def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
         api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY must be provided")
-        
-        model_name = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022")
+            raise ValueError("ANTHROPIC_API_KEY must be set in environment or passed in.")
+
+        model_name = model_name or os.getenv(
+            "ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"
+        )
+
         self.llm = ChatAnthropic(
             model=model_name,
             api_key=api_key,
-            temperature=0.7,
+            temperature=0.3,
         )
+
+        # LangGraph checkpointer so we can pause/resume (HITL)
         self.memory = MemorySaver()
         self.graph = self._build_graph()
-    
-    def _build_graph(self):
-        """Build graph with interrupt capability for sequential adjustments."""
-        workflow = StateGraph(SequentialAgentState)
-        
-        workflow.add_node("check_input", self._check_for_adjustment)
-        workflow.add_node("process", self._process_task)
-        workflow.add_node("generate", self._generate_output)
-        
-        # Entry point is process - start processing immediately after initial query
-        workflow.set_entry_point("process")
-        workflow.add_conditional_edges(
-            "check_input",
-            self._route_after_check,
-            {
-                "process": "process",
-                "adjust": "check_input",  # Loop back if adjustment received
-            }
-        )
-        workflow.add_conditional_edges(
-            "process",
-            self._route_after_process,
-            {
-                "adjust": "check_input",  # Loop back if adjustment received
-                "generate": "generate",   # Proceed to generate if no adjustment
-            }
-        )
-        workflow.add_edge("generate", END)
-        
-        return workflow.compile(checkpointer=self.memory)
-    
-    def _route_after_check(self, state: SequentialAgentState) -> str:
-        """Route based on whether adjustment was received."""
-        # Check if we should continue checking for more adjustments
-        if state.get("continue_checking", False):
-            # Clear the flag and loop back to check for more adjustments
-            state["continue_checking"] = False
-            return "adjust"  # Loop back to check_input
-        
-        # No more adjustments expected, proceed to process
-        return "process"
-    
-    def _route_after_process(self, state: SequentialAgentState) -> str:
-        """Route after process - check if adjustment was received during work."""
-        # If continue_checking is True, it means an adjustment was received during process
-        if state.get("continue_checking", False):
-            # Clear flag and loop back to check for more adjustments
-            state["continue_checking"] = False
-            print("[DEBUG] Adjustment received during process, routing back to check_input")
-            return "adjust"  # Loop back to check_input
-        
-        # No adjustment received, proceed to generate
-        print("[DEBUG] Process completed, routing to generate")
-        return "generate"
-    
-    def _check_for_adjustment(self, state: SequentialAgentState) -> SequentialAgentState:
-        """
-        Check for new adjustments - uses interrupt() to pause and check.
-        Follows LangGraph documentation pattern.
-        """
-        current_goal = state.get("current_goal", "")
-        initial_goal = state.get("initial_goal", "")
-        messages = state.get("messages", [])
-        all_adjustments = state.get("all_adjustments", [])
-        
-        # If this is first run, set initial goal
-        if not initial_goal and messages:
-            latest_msg = messages[-1]
-            if isinstance(latest_msg, HumanMessage):
-                goal = latest_msg.content
-                state["initial_goal"] = goal
-                state["current_goal"] = goal
-                state["all_adjustments"] = []
-                state["adjustment_count"] = 0
-                state["task_started_at"] = datetime.now().isoformat()
-                state["continue_checking"] = True  # Allow checking for adjustments
-                return state
-        
-        # Check for new input using interrupt - this pauses execution
-        # Following LangGraph documentation: interrupt() pauses, Command(resume=value) resumes
-        if current_goal:
-            prompt = f"Current task: '{current_goal[:70]}...' | Send adjustment to modify, or press Enter to continue."
-        else:
-            prompt = "Send adjustment or press Enter to continue."
-        
-        new_input = interrupt(prompt)
-        
-        # If new input received
-        if new_input and new_input.strip():
-            # Determine if it's an adjustment or new task
-            is_adjustment = self._is_adjustment(new_input.strip(), current_goal)
-            
-            if is_adjustment:
-                # Sequential adjustment - combine with current goal
-                adjustment = new_input.strip()
-                all_adjustments.append(adjustment)
-                
-                # Build combined goal: initial + all adjustments
-                combined_parts = [initial_goal] + all_adjustments
-                combined_goal = " ".join(combined_parts)
-                
-                print(f"\n[ADJUSTMENT #{len(all_adjustments)}] Received: '{adjustment}'")
-                print(f"[UPDATE] Combined goal: '{combined_goal}'")
-                
-                state["current_goal"] = combined_goal
-                state["all_adjustments"] = all_adjustments
-                state["adjustment_count"] = len(all_adjustments)
-                state["last_adjustment_at"] = datetime.now().isoformat()
-                state["continue_checking"] = True  # Continue checking for more adjustments
-                
-                # Add message to conversation history
-                if "messages" not in state:
-                    state["messages"] = []
-                state["messages"].append(HumanMessage(content=adjustment))
-            else:
-                # New task - reset everything
-                print(f"\n[NEW TASK] Received: '{new_input}'")
-                print(f"[RESET] Starting new task (previous task cancelled)")
-                
-                state["initial_goal"] = new_input.strip()
-                state["current_goal"] = new_input.strip()
-                state["all_adjustments"] = []
-                state["adjustment_count"] = 0
-                state["task_started_at"] = datetime.now().isoformat()
-                state["continue_checking"] = False  # New task, proceed to process
-                
-                if "messages" not in state:
-                    state["messages"] = []
-                state["messages"].append(HumanMessage(content=new_input.strip()))
-        else:
-            # No input received (user pressed Enter), clear flag to proceed to process
-            state["continue_checking"] = False
-            print("[DEBUG] No input received, proceeding to process")
-        
-        return state
-    
-    def _process_task(self, state: SequentialAgentState) -> SequentialAgentState:
-        """
-        Process the current task - simulate work with periodic interrupt checks.
-        Uses interrupt() pattern from LangGraph documentation.
-        """
-        goal = state.get("current_goal", "")
-        if not goal:
-            return state
-        
-        print(f"\n[PROCESS] Starting to work on: {goal}")
-        print("[INFO] You can send adjustments anytime during the next 60 seconds!")
-        
-        # Simulate 60 seconds of work, but check for adjustments periodically
-        work_duration = 60.0
-        check_interval = 10.0  # Check every 10 seconds
-        elapsed = 0.0
-        
-        while elapsed < work_duration:
-            remaining = work_duration - elapsed
-            print(f"[WORK] Processing... ({elapsed:.0f}s / {work_duration:.0f}s elapsed)")
-            
-            # Use interrupt() to pause and allow adjustments - follows documentation pattern
-            new_input = interrupt(f"Working on task ({elapsed:.0f}s elapsed). Send adjustment or Enter to continue.")
-            
-            # If new input received
-            if new_input and new_input.strip():
-                is_adjustment = self._is_adjustment(new_input.strip(), goal)
-                
-                messages = state.get("messages", [])
-                messages.append(HumanMessage(content=new_input.strip()))
-                
-                if is_adjustment:
-                    # Sequential adjustment during work
-                    all_adjustments = state.get("all_adjustments", [])
-                    adjustment = new_input.strip()
-                    all_adjustments.append(adjustment)
-                    
-                    initial_goal = state.get("initial_goal", goal)
-                    combined_parts = [initial_goal] + all_adjustments
-                    combined_goal = " ".join(combined_parts)
-                    
-                    print(f"\n[ADJUSTMENT #{len(all_adjustments)}] Received during work: '{adjustment}'")
-                    print(f"[UPDATE] Updated goal: '{combined_goal}'")
-                    
-                    return {
-                        **state,
-                        "current_goal": combined_goal,
-                        "all_adjustments": all_adjustments,
-                        "adjustment_count": len(all_adjustments),
-                        "last_adjustment_at": datetime.now().isoformat(),
-                        "continue_checking": True,  # Continue checking for more adjustments
-                        "messages": messages,
-                    }
-                else:
-                    # New task - CANCEL previous task and start new one
-                    previous_goal = goal
-                    print(f"\n[CANCEL] Previous task cancelled: '{previous_goal}'")
-                    print(f"[NEW TASK] Starting new task: '{new_input.strip()}'")
-                    print(f"[RESET] All previous work cancelled, switching to new direction")
-                    
-                    return {
-                        **state,
-                        "initial_goal": new_input.strip(),
-                        "current_goal": new_input.strip(),
-                        "all_adjustments": [],  # Reset adjustments for new task
-                        "adjustment_count": 0,
-                        "task_started_at": datetime.now().isoformat(),
-                        "messages": messages,
-                        "continue_checking": False,  # New task, proceed to process
-                    }
-            
-            # Simulate work
-            import time
-            sleep_time = min(check_interval, remaining)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            elapsed += check_interval
-        
-        print(f"\n[COMPLETE] Finished processing: {goal}")
-        print("[DEBUG] Process node returning, will route to generate")
-        # Ensure continue_checking is False so routing goes to generate
-        state["continue_checking"] = False
-        return state
-    
-    def _generate_output(self, state: SequentialAgentState) -> SequentialAgentState:
-        """
-        Generate final output based on combined goal with all adjustments.
-        Maintains conversation context from all messages.
-        """
-        goal = state.get("current_goal", "")
-        initial_goal = state.get("initial_goal", "")
-        all_adjustments = state.get("all_adjustments", [])
-        messages = state.get("messages", [])
-        
-        if not goal:
-            print("[DEBUG] No goal in state, skipping generation")
-            return state
-        
-        print(f"\n[GENERATE] Generating output with all adjustments...")
-        print(f"  Initial goal: {initial_goal}")
-        if all_adjustments:
-            print(f"  Adjustments ({len(all_adjustments)}): {', '.join(all_adjustments)}")
-        
-        # Create comprehensive prompt that includes all context
-        if all_adjustments:
-            adjustments_text = "\n".join(f"- {adj}" for adj in all_adjustments)
-            prompt = f"""User request: "{initial_goal}"
 
-Additional requirements/adjustments:
+    # ------------------------------------------------------------------
+    # Heuristic: is this new input an *adjustment* or a *new task*?
+    # ------------------------------------------------------------------
+
+    def _is_adjustment(self, new_input: str, current_goal: str) -> bool:
+        """
+        Heuristic to decide whether new_input is an adjustment to the current task
+        or a completely new task that should replace it.
+
+        - Short, modifier-like inputs ("add", "use", "include", etc.) are
+          treated as adjustments.
+        - Long inputs that look like fresh standalone tasks, especially with
+          low word overlap with the current goal, are treated as new tasks.
+        """
+        new_input = new_input.strip()
+        new_lower = new_input.lower()
+        goal_lower = current_goal.lower().strip()
+
+        # If there is no current goal, treat this as a new task.
+        if not goal_lower:
+            return False
+
+        # Phrases that usually mean "throw away old, start something else"
+        cancellation_indicators = [
+            "actually",
+            "instead",
+            "forget",
+            "ignore",
+            "cancel",
+            "stop",
+            "scratch that",
+            "never mind",
+            "change to",
+            "switch to",
+            "do this instead",
+            "no wait",
+            "focus on",
+            "just ",
+        ]
+        for ind in cancellation_indicators:
+            if new_lower.startswith(ind):
+                return False
+
+        # Phrases that usually mean "refine/extend this task"
+        adjustment_indicators = [
+            "also",
+            "and",
+            "add",
+            "include",
+            "update",
+            "modify",
+            "adjust",
+            "edit",
+            "expand",
+            "elaborate",
+            "more",
+            "further",
+            "additionally",
+            "use",
+            "specifically",
+            "with",
+            "implement",
+            "ensure",
+            "make sure",
+            "don't forget",
+            "plus",
+        ]
+        for ind in adjustment_indicators:
+            if new_lower.startswith(ind):
+                return True
+
+        # Very short inputs are often "quick tweaks"
+        if len(new_input.split()) <= 5 and len(new_input) < 60:
+            return True
+
+        # If there is almost no word overlap with the current goal and the
+        # new input is substantial, treat as a new task.
+        goal_words = set(goal_lower.split())
+        new_words = set(new_lower.split())
+        overlap = len(goal_words.intersection(new_words))
+
+        if overlap < 2 and len(new_input.split()) > 8:
+            return False
+
+        # Default bias: short-ish things are adjustments, long are new tasks.
+        return len(new_input.split()) <= 10
+
+    # ------------------------------------------------------------------
+    # Graph definition
+    # ------------------------------------------------------------------
+
+    def _build_graph(self):
+        workflow = StateGraph(SequentialAdjustmentState)
+
+        workflow.add_node("init_goal", self._init_goal)
+        workflow.add_node("collect_adjustments", self._collect_adjustments)
+        workflow.add_node("generate_output", self._generate_output)
+
+        # Start at init_goal
+        workflow.add_edge(START, "init_goal")
+        workflow.add_edge("init_goal", "collect_adjustments")
+
+        # From collect_adjustments, either:
+        #   - loop to collect more adjustments
+        #   - or go to generate_output
+        workflow.add_conditional_edges(
+            "collect_adjustments",
+            self._route_after_collect,
+            {"more": "collect_adjustments", "generate": "generate_output"},
+        )
+
+        workflow.add_edge("generate_output", END)
+
+        return workflow.compile(checkpointer=self.memory)
+
+    # ------------------------------------------------------------------
+    # Nodes
+    # ------------------------------------------------------------------
+
+    def _init_goal(self, state: SequentialAdjustmentState) -> SequentialAdjustmentState:
+        """Initialize base_goal/current_goal from the latest HumanMessage."""
+        messages = state.get("messages", [])
+        base_goal = state.get("base_goal")
+
+        if not base_goal:
+            # Find the last human message
+            for m in reversed(messages):
+                if isinstance(m, HumanMessage):
+                    base_goal = m.content
+                    break
+
+        if not base_goal:
+            # No usable goal, just return state unchanged
+            return state
+
+        adjustments = state.get("adjustments", [])
+        adjustment_count = len(adjustments)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        return {
+            **state,
+            "base_goal": base_goal,
+            "current_goal": base_goal if not adjustments else " ".join([base_goal] + adjustments),
+            "adjustments": adjustments,
+            "adjustment_count": adjustment_count,
+            "created_at": state.get("created_at", now_iso),
+            "last_updated_at": now_iso,
+            "done_collecting": False,
+        }
+
+    def _collect_adjustments(
+        self, state: SequentialAdjustmentState
+    ) -> SequentialAdjustmentState:
+        """
+        Node that uses `interrupt()` to gather adjustments or start a new task.
+
+        This is where the official HITL pattern is used:
+        - Graph stops at `interrupt(...)`
+        - External caller resumes with `Command(resume="...")`
+        """
+        base_goal = state.get("base_goal", "").strip()
+        current_goal = state.get("current_goal", base_goal)
+        adjustments = state.get("adjustments", [])
+        messages = state.get("messages", [])
+
+        # Ask the human for an adjustment, a new task, or "done".
+        prompt = (
+            "Current task / combined goal:\n"
+            f"  {current_goal}\n\n"
+            "Enter one of the following:\n"
+            "- Additional instructions to adjust/refine this task\n"
+            "- A completely new task to replace it\n"
+            "- 'done' (or just press Enter) when you're finished giving adjustments.\n"
+        )
+        user_text = interrupt(prompt)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # If user_text is None or empty => user is done giving adjustments
+        if not user_text or not str(user_text).strip():
+            return {
+                **state,
+                "done_collecting": True,
+                "last_updated_at": now_iso,
+            }
+
+        user_text_str = str(user_text).strip()
+        lower = user_text_str.lower()
+
+        # If user explicitly says "done" / "no" / "continue"
+        if lower in {"done", "no", "n", "ok", "okay", "continue", "go ahead"}:
+            return {
+                **state,
+                "done_collecting": True,
+                "last_updated_at": now_iso,
+            }
+
+        # Add this as a new human message in the history
+        messages.append(HumanMessage(content=user_text_str))
+
+        # Decide whether this is an adjustment or a completely new task
+        if self._is_adjustment(user_text_str, current_goal or base_goal):
+            # Adjustment case: append and recompute combined goal
+            adjustments.append(user_text_str)
+            combined_goal = " ".join([base_goal] + adjustments)
+
+            print(f"[ADJUSTMENT #{len(adjustments)}] {user_text_str}")
+            print(f"[UPDATED GOAL] {combined_goal}")
+
+            return {
+                **state,
+                "messages": messages,
+                "adjustments": adjustments,
+                "adjustment_count": len(adjustments),
+                "current_goal": combined_goal,
+                "done_collecting": False,  # keep collecting until user says done
+                "last_updated_at": now_iso,
+            }
+        else:
+            # New task: reset adjustments and treat this as a fresh base_goal
+            print(f"[NEW TASK] {user_text_str}")
+            print("[RESET] Previous task is replaced by this new task.")
+
+            return {
+                **state,
+                "messages": messages,
+                "base_goal": user_text_str,
+                "current_goal": user_text_str,
+                "adjustments": [],
+                "adjustment_count": 0,
+                "done_collecting": False,
+                "last_updated_at": now_iso,
+            }
+
+    def _route_after_collect(self, state: SequentialAdjustmentState) -> str:
+        """Route logic after collect_adjustments."""
+        if state.get("done_collecting", False):
+            return "generate"
+        return "more"
+
+    def _generate_output(
+        self, state: SequentialAdjustmentState
+    ) -> SequentialAdjustmentState:
+        """
+        Final node: generate output using the combined goal and full message history.
+        """
+        base_goal = state.get("base_goal", "")
+        current_goal = state.get("current_goal", base_goal)
+        adjustments = state.get("adjustments", [])
+        messages = state.get("messages", [])
+
+        if not current_goal:
+            return state
+
+        print("\n[GENERATE] Creating final output using all requirements...")
+        print(f"- Base goal: {base_goal}")
+        if adjustments:
+            print(f"- Adjustments ({len(adjustments)}):")
+            for i, adj in enumerate(adjustments, start=1):
+                print(f"  {i}. {adj}")
+
+        if adjustments:
+            adjustments_text = "\n".join(f"- {a}" for a in adjustments)
+            final_prompt = f"""You are helping the user with an evolving task.
+
+Initial user request:
+\"\"\"{base_goal}\"\"\"
+
+Additional requirements / adjustments provided later:
 {adjustments_text}
 
-Combined task: "{goal}"
+Combined final task:
+\"\"\"{current_goal}\"\"\"
 
-Generate the requested content according to ALL the requirements above.
-Include everything from the initial request and all subsequent adjustments.
-Maintain context and coherence across all requirements.
+Now produce a single, coherent final answer that:
+- Fully satisfies the initial request, AND
+- Incorporates **all** of the adjustments above.
 """
         else:
-            prompt = f"""User request: "{goal}"
+            final_prompt = f"""User request:
+\"\"\"{current_goal}\"\"\"
 
-Generate the requested content according to the instructions.
+Produce the best possible answer that follows these instructions.
 """
-        
+
+        # Use the entire conversation history for context, plus this final summarizing prompt.
+        convo = messages + [HumanMessage(content=final_prompt)]
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
         try:
-            # Use conversation history for context
-            context_messages = messages + [HumanMessage(content=prompt)]
-            print(f"[DEBUG] Calling LLM with {len(context_messages)} messages")
-            response = self.llm.invoke(context_messages)
-            
-            state["output"] = response.content
-            print(f"[DEBUG] Generated output length: {len(response.content)} characters")
+            response = self.llm.invoke(convo)
+            output = response.content
+
+            # Add assistant message to history as well
+            messages.append(response)
+
+            return {
+                **state,
+                "messages": messages,
+                "output": output,
+                "last_updated_at": now_iso,
+            }
         except Exception as e:
-            print(f"[ERROR] Failed to generate output: {e}")
-            import traceback
-            traceback.print_exc()
-            state["output"] = f"Error generating output: {str(e)}"
-        
-        return state
-    
-    async def run(self, thread_id: str = "sequential_session"):
-        """Run sequential adjustment HITL session."""
+            err_msg = f"Error generating output: {e}"
+            print(err_msg)
+            return {
+                **state,
+                "output": err_msg,
+                "last_updated_at": now_iso,
+            }
+
+    # ------------------------------------------------------------------
+    # CLI Runner using official `interrupt` + `Command(resume=...)` pattern
+    # ------------------------------------------------------------------
+
+    def run(self, thread_id: str = "sequential_adjustments_session"):
+        """
+        Run a single sequential-adjustment session via CLI.
+
+        Pattern:
+        - First call `graph.stream` with the initial user message.
+        - The graph stops at `interrupt`.
+        - While `state.next` is not empty, we resume with `Command(resume=...)`.
+        - When finished, we inspect final state and print summary.
+        """
         config = {"configurable": {"thread_id": thread_id}}
-        
+
         print("=" * 80)
         print("Sequential Adjustment HITL Agent")
         print("=" * 80)
-        print("\nInstructions:")
-        print("- Enter your initial task/query")
-        print("- Agent will process for 60 seconds")
-        print("- During processing, you can send MULTIPLE sequential adjustments")
-        print("- All adjustments will be combined and included in final output")
-        print("- Session history maintains all inputs for context")
-        print("- Type 'exit' or 'quit' to stop")
-        print("=" * 80)
-        print()
-        
-        # Get initial input
-        initial_input = input("Enter your initial task/query: ").strip()
-        
-        if not initial_input or initial_input.lower() in ['exit', 'quit']:
-            print("Exiting...")
+        print("Instructions:")
+        print("- Enter any initial task (e.g., API design, spec writing, etc.)")
+        print("- Then enter 0 or more adjustments.")
+        print("- Type 'done' (or just press Enter) when you're finished adjusting.")
+        print("- Type 'exit' or 'quit' at any prompt to stop.\n")
+
+        initial = input("Initial task: ").strip()
+        if not initial or initial.lower() in {"exit", "quit"}:
+            print("Exiting.")
             return
-        
-        # Initialize state
-        initial_state: SequentialAgentState = {
-            "messages": [HumanMessage(content=initial_input)],
-            "initial_goal": initial_input,
-            "current_goal": initial_input,
-            "all_adjustments": [],
-            "adjustment_count": 0,
-            "output": "",
-            "task_started_at": datetime.now().isoformat(),
-            "last_adjustment_at": None,
-            "continue_checking": True,  # Start by checking for adjustments
-        }
-        
-        self.graph.update_state(config, initial_state)
-        
-        # Start processing
-        print(f"\n[START] Initial task: {initial_input}")
-        
-        # Run graph - it will pause at interrupt() calls
-        async for event in self.graph.astream(None, config):
-            for node, node_state in event.items():
-                print(f"[DEBUG] Node executed: {node}")
-        
-        # Handle interrupts - keep resuming until done
-        # Follows LangGraph documentation pattern: https://langchain-ai.github.io/langgraph/how-tos/human_in_the_loop/wait-user-input/#agent
-        current_state = self.graph.get_state(config)
-        done = False
-        
-        while not done and current_state and current_state.next:
-            # Graph is paused at interrupt() - get user input
-            user_input = input("\n> ").strip()
-            
-            if user_input.lower() in ['exit', 'quit']:
-                print("Exiting...")
+
+        # Kick off the graph with the initial user message
+        initial_messages = [HumanMessage(content=initial)]
+
+        for _ in self.graph.stream(
+            {"messages": initial_messages}, config, stream_mode="values"
+        ):
+            # We don't need per-event printing here; we're just driving the state machine.
+            pass
+
+        # Now handle any interrupts (multiple sequential adjustments)
+        while True:
+            state = self.graph.get_state(config)
+            # If there is no "next", the graph has finished
+            if not state.next:
                 break
-            
-            # Resume with user input - follows LangGraph pattern from documentation
-            async for event in self.graph.astream(Command(resume=user_input), config):
-                for node, node_state in event.items():
-                    print(f"[DEBUG] Node executed after resume: {node}")
-            
-            # Check state after resume
-            current_state = self.graph.get_state(config)
-            
-            # Continue execution until graph pauses again or completes
-            # When a node completes (no next), LangGraph should automatically call routing function
-            # for conditional edges, then execute the next node
-            while not done and not current_state.next:
-                # Node completed - continue execution to trigger routing and next node
-                print("[DEBUG] Node completed, continuing execution to trigger routing...")
-                async for event in self.graph.astream(None, config):
-                    for node, node_state in event.items():
-                        print(f"[DEBUG] Continuing execution - Node: {node}")
-                
-                # Check state again
-                current_state = self.graph.get_state(config)
-                
-                # If graph is paused (has next), break inner loop to handle interrupt
-                if current_state.next:
-                    break
-                
-                # Check if we're done
-                final_check = self.graph.get_state(config)
-                if final_check.values.get("output"):
-                    # Output generated, we're done
-                    done = True
-                    break
-        
-        # Get final results
-        final_state = self.graph.get_state(config)
-        result = final_state.values
-        
+
+            # Graph is paused at interrupt() and expects human input
+            user_input = input("\nAdjustment / new task / 'done': ").strip()
+
+            if user_input.lower() in {"exit", "quit"}:
+                print("Exiting.")
+                return
+
+            # Resume execution using LangGraph's official pattern
+            for _ in self.graph.stream(
+                Command(resume=user_input), config, stream_mode="values"
+            ):
+                pass
+
+        # Final state
+        final_state = self.graph.get_state(config).values
+
+        base_goal = final_state.get("base_goal", "")
+        current_goal = final_state.get("current_goal", "")
+        adjustments = final_state.get("adjustments", []) or []
+        adjustment_count = final_state.get("adjustment_count", 0)
+        output = final_state.get("output", "")
+        messages = final_state.get("messages", []) or []
+
         print("\n" + "=" * 80)
         print("FINAL RESULTS")
         print("=" * 80)
-        print(f"Initial Goal: {result.get('initial_goal', 'N/A')}")
-        print(f"Total Adjustments: {result.get('adjustment_count', 0)}")
-        if result.get('all_adjustments'):
-            print("Adjustments:")
-            for i, adj in enumerate(result.get('all_adjustments', []), 1):
-                print(f"  {i}. {adj}")
-        print(f"Final Combined Goal: {result.get('current_goal', 'N/A')}")
-        print(f"Output Length: {len(result.get('output', ''))} characters")
-        print("\nSession History:")
+        print(f"Base goal:          {base_goal}")
+        print(f"Final combined goal:{current_goal}")
+        print(f"Total adjustments:  {adjustment_count}")
+        if adjustments:
+            print("Adjustments (in order):")
+            for idx, adj in enumerate(adjustments, 1):
+                print(f"  {idx}. {adj}")
+
+        print("\nSession History (user messages only):")
         print("-" * 80)
-        messages = result.get('messages', [])
-        for i, msg in enumerate(messages, 1):
+        i = 1
+        for msg in messages:
             if isinstance(msg, HumanMessage):
-                print(f"{i}. User: {msg.content}")
+                print(f"{i}. USER: {msg.content}")
+                i += 1
+
         print("-" * 80)
         print("\nFinal Output:")
         print("-" * 80)
-        print(result.get('output', 'No output generated'))
+        print(output or "<no output generated>")
         print("-" * 80)
 
 
-async def main():
-    """Main entry point."""
+# --------------------------------------------------------------------------------------
+# Script entrypoint
+# --------------------------------------------------------------------------------------
+
+
+def main():
     try:
         agent = SequentialAdjustmentAgent()
-        await agent.run()
+        agent.run()
     except KeyboardInterrupt:
-        print("\n\nInterrupted by user. Exiting...")
+        print("\nInterrupted by user. Exiting...")
     except Exception as e:
         print(f"\nError: {e}")
         import traceback
+
         traceback.print_exc()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
+    main()
